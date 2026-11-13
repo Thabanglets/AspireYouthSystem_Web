@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aspire Youth Initiative</title>
+<link rel="icon" href="assets/images/logo-clean.png">
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="assets/style.css" rel="stylesheet">
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+import { dataRef, firebaseDb, ref, onValue, runTransaction, auth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, set, push } from './assets/firebase.js';
+/* Aspire Youth Initiative: single-page system, plain HTML + JavaScript.
+   Profiles and application data are stored in Firebase Realtime Database; passwords are managed by Firebase Authentication.
+   First admin login: username "admin", password below. Change it before first use. */
+const ADMIN_USER = 'admin', ADMIN_PASS = 'admin1234';
+(() => {
+const KEY = 'ayi', EM = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i, PH = /^\d{10}$/, EP = '[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}';
+const $ = s => document.querySelector(s), app = $('#app');
+const e = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const emptyData = () => ({students:[],tutors:[],sessions:[],attendance:[],grades:[],admins:[],users:{},n:1});
+const normalizeData = d => {
+  const data = d && typeof d === 'object' ? d : {};
+  const out = emptyData();
+  for (const key of Object.keys(out)) {
+    if (key === 'n') continue;
+    if (key === 'users') { out.users = data.users && typeof data.users === 'object' ? data.users : {}; continue; }
+    out[key] = Array.isArray(data[key]) ? data[key] : data[key] && typeof data[key] === 'object' ? Object.values(data[key]) : [];
+  }
+  out.n = Number.isSafeInteger(data.n) && data.n > 0 ? data.n : 1;
+  out.seeded = data.seeded ? 1 : 0;
+  return out;
+};
+const copy = d => JSON.parse(JSON.stringify(d));
+const readLegacyData = () => {
+  try {
+    const data = JSON.parse(localStorage.getItem(KEY));
+    return data && data.students ? normalizeData(data) : null;
+  } catch (error) {
+    console.warn('Could not read the previous browser data; Firebase will be initialized with starter data.', error);
+    return null;
+  }
+};
+const legacyData = readLegacyData();
+let db = emptyData(), baseline = null, ready = false, connectionError = null;
+const mergeChanges = (remote, before, desired) => {
+  if (!before) return copy(desired);
+  const result = normalizeData(remote);
+  for (const key of ['students','tutors','sessions','attendance','grades','admins']) {
+    const identity = item => String(item.id ?? item.u);
+    const oldRows = new Map(before[key].map(item => [identity(item), item]));
+    const newRows = new Map(desired[key].map(item => [identity(item), item]));
+    result[key] = result[key].filter(item => newRows.has(identity(item)) || !oldRows.has(identity(item)));
+    for (const [id, item] of newRows) {
+      if (oldRows.has(id) && JSON.stringify(oldRows.get(id)) === JSON.stringify(item)) continue;
+      const index = result[key].findIndex(row => identity(row) === id);
+      if (index < 0) result[key].push(item);
+      else result[key][index] = item;
+    }
+  }
+  result.n = Math.max(result.n, desired.n);
+  result.seeded = result.seeded || desired.seeded;
+  return result;
+};
+let writeQueue = Promise.resolve();
+const save = () => {
+  const desired = copy(db);
+  writeQueue = writeQueue.then(async () => {
+    const before = baseline && copy(baseline);
+    const result = await runTransaction(dataRef, remote => mergeChanges(remote, before, desired), {applyLocally:false});
+    if (!result.committed) throw new Error('Firebase did not commit the database update.');
+    db = normalizeData(result.snapshot.val());
+    baseline = copy(db);
+  }).catch(error => {
+    console.error('Firebase database write failed.', error);
+    if (baseline) db = copy(baseline);
+    note = {t:'danger', m:'Could not save your changes to Firebase. Check your internet connection and Realtime Database rules, then try again.'};
+    render();
+    return false;
+  });
+  return writeQueue.then(result => result === false ? false : true);
+};
+let me = JSON.parse(sessionStorage.getItem('me') || 'null'), note = null, pre = 0;
+const HASH_ERROR = 'SHA-256 password hashing is unavailable. Open this site over HTTPS or localhost in a modern browser.';
+const hash = async s => {
+  if (!globalThis.crypto?.subtle) throw new Error(HASH_ERROR);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode('ayi:' + s));
+  return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('');
+};
+const nextId = () => {
+  const id = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+  db.n = Math.max(db.n, id + 1);
+  return id;
+};
+
+/* ---- helpers ---- */
+const by = (a, id) => a.find(x => x.id === id), nm = p => p ? p.first + ' ' + p.last : '(removed)';
+const cap = s => s[0].toUpperCase() + s.slice(1);
+const fd = d => new Date(d + 'T00:00').toLocaleDateString(undefined, {weekday:'short', day:'numeric', month:'short', year:'numeric'});
+const td = () => { const x = new Date(); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); };
+const badge = s => `<span class="badge text-bg-${{Approved:'success',Pending:'warning',Rejected:'danger',Present:'success',Absent:'danger'}[s] || 'secondary'}">${e(s)}</span>`;
+const alertH = (t, m) => `<div class="alert alert-${t}" role="${t == 'danger' ? 'alert' : 'status'}">${m}</div>`;
+const take = () => { const h = note ? alertH(note.t, note.m) : ''; note = null; return h; };
+const fail = l => { $('#note').innerHTML = alertH('danger', l.length > 1 ? '<ul class="mb-0 ps-3">' + l.map(x => `<li>${e(x)}</li>`).join('') + '</ul>' : e(l[0])); };
+const go = to => location.hash === '#' + to ? render() : (location.hash = to);
+const ok = (m, to) => { note = {t:'success', m:e(m)}; go(to); };
+const hd = (t, s) => `<div class="page-head"><h1>${t}</h1><p class="text-muted mb-0">${s}</p></div>`;
+const stat = (n, l, h) => `<div class="col-6 col-lg-3"><a class="stat" href="#${h}"><span class="num">${n}</span><span class="lbl">${l}</span></a></div>`;
+const btn = (act, id, l, c, s = '') => `<button class="btn btn-sm ${c}" data-act="${act}" data-id="${id}" data-s="${s}">${l}</button>`;
+const tbl = (h, rows, msg) => `<div class="panel-card"><div class="table-responsive"><table class="table"><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${h.length}" class="empty">${msg}</td></tr>`}</tbody></table></div></div>`;
+const card = (t, b) => `<div class="panel-card mb-4"><h2>${t}</h2>${b}</div>`;
+const prof = rows => `<div class="panel-card"><table class="table"><tbody>${rows.map(([k, v]) => `<tr><th scope="row">${k}</th><td>${v}</td></tr>`).join('')}</tbody></table></div>`;
+
+/* ---- validation: valid email address; phone is 10 digits ---- */
+const R = {em: [v => EM.test(v), 'Enter a valid email address, like name@example.com.'], ph: [v => PH.test(v), 'Enter exactly 10 digits, numbers only.']};
+const chk = (t, show) => {
+  const r = R[t.dataset.v];
+  if (!r) { t.setCustomValidity(''); t.classList.remove('is-invalid'); return true; }
+  const v = t.value.trim(), good = !v || r[0](v);
+  t.setCustomValidity(good ? '' : r[1]);
+  if (good) t.classList.remove('is-invalid'); else if (show) t.classList.add('is-invalid');
+  return good;
+};
+const vp = (d, t, conf) => {
+  const r = [];
+  if (!d.first.trim() || d.first.length > 50) r.push('Enter a first name (up to 50 characters).');
+  if (!d.last.trim() || d.last.length > 50) r.push('Enter a last name (up to 50 characters).');
+  if (t && (!d.subject.trim() || d.subject.length > 80)) r.push('Enter the subject (up to 80 characters).');
+  if (!EM.test(d.email.trim())) r.push('Email must contain an @ and end in .com, for example name@example.com.');
+  if (!PH.test(d.phone.trim())) r.push('Phone number must be exactly 10 digits, numbers only.');
+  if (d.password.length < 8) r.push('Password must be at least 8 characters.');
+  if (conf && d.password !== d.confirm) r.push('The two passwords do not match.');
+  return r;
+};
+
+/* ---- form fields ---- */
+const fld = (id, l, n, t = 'text', x = '', hint = '', bad = '') => `<div class="mb-3"><label class="form-label" for="${id}">${l}</label><input class="form-control" id="${id}" name="${n}" type="${t}" required ${x}>${bad ? `<div class="invalid-feedback">${bad}</div>` : ''}${hint ? `<div class="form-text">${hint}</div>` : ''}</div>`;
+const emF = id => fld(id, 'Email address', 'email', 'email', `data-v="em" maxlength="254" pattern="${EP}" autocomplete="email"`, 'Enter a valid email address', R.em[1]);
+const phF = id => fld(id, 'Phone number', 'phone', 'tel', 'data-v="ph" maxlength="10" pattern="[0-9]{10}" inputmode="numeric" autocomplete="tel-national"', '10 digits, numbers only', R.ph[1]);
+const pwF = (id, n, l, hint = 'At least 8 characters') => fld(id, l, n, 'password', 'minlength="8" autocomplete="new-password"', hint);
+const pf = (p, t, c, w) => { const h = w ? 'col-md-6' : 'col-12'; return `<div class="row gx-3"><div class="col-sm-6">${fld(p + 'f', 'First name', 'first', 'text', 'maxlength="50"')}</div><div class="col-sm-6">${fld(p + 'l', 'Last name', 'last', 'text', 'maxlength="50"')}</div>${t ? `<div class="${h}">${fld(p + 's', 'Subject', 'subject', 'text', 'maxlength="80" placeholder="e.g. Mathematics"')}</div>` : ''}<div class="${h}">${emF(p + 'e')}</div><div class="${h}">${phF(p + 'p')}</div><div class="${h}">${pwF(p + 'w', 'password', c ? 'Create password' : 'Password')}</div>${c ? `<div class="${h}">${pwF(p + 'c', 'confirm', 'Confirm password', '')}</div>` : ''}</div>`; };
+const sel = (id, n, l, opts, w = 'col-md-6') => `<div class="${w} mb-3"><label class="form-label" for="${id}">${l}</label><select class="form-select" id="${id}" name="${n}" required>${opts}</select></div>`;
+const opt = (a, f, ph, sv) => `<option value="">${ph}</option>` + a.map(x => `<option value="${x.id}"${x.id === sv ? ' selected' : ''}>${e(f(x))}</option>`).join('');
+
+/* ---- sign-in screen ---- */
+const AU = {
+  login: () => `<h1>Welcome back</h1><p class="text-muted">Choose how you are signing in.</p><form data-f="login"><div class="btn-group w-100 mb-3 role-switch">${['student','tutor','admin'].map((r, i) => `<input type="radio" class="btn-check" name="role" id="r-${r}" value="${r}" ${i ? '' : 'checked'}><label class="btn btn-outline-primary" for="r-${r}">${cap(r)}</label>`).join('')}</div><div class="mb-3"><label class="form-label" for="lid" id="lidl">Email address</label><input class="form-control" id="lid" name="identifier" type="email" required maxlength="254" data-v="em" pattern="${EP}" autocomplete="username"><div class="invalid-feedback">${R.em[1]}</div><div class="form-text" id="lidh">Enter a valid email address</div></div><div class="mb-4"><label class="form-label" for="lpw">Password</label><input class="form-control" id="lpw" name="password" type="password" required autocomplete="current-password"></div><button class="btn btn-primary w-100">Log in</button></form><div id="cred" class="mt-4"></div>`,
+  'register-student': () => `<h1>Create a student account</h1><p class="text-muted">An administrator approves new accounts before you can log in.</p><form data-f="rs">${pf('rs', 0, 1, 0)}<button class="btn btn-primary w-100">Register</button></form>`,
+  'register-tutor': () => `<h1>Apply as a tutor</h1><p class="text-muted">An administrator reviews every application.</p><form data-f="rt">${pf('rt', 1, 1, 0)}<button class="btn btn-primary w-100">Submit application</button></form>`
+};
+const authScreen = t => `<main class="auth"><section class="auth-brand"><img class="auth-logo" src="assets/images/logo-clean.png" alt="Aspire Youth Initiative"></section><section class="auth-main"><div class="auth-card"><nav class="auth-tabs">${[['login','Log in'],['register-student','Student sign-up'],['register-tutor','Tutor sign-up']].map(([k, l]) => `<a href="#${k}" class="${k == t ? 'active' : ''}">${l}</a>`).join('')}</nav><div id="note">${take()}</div>${AU[t]()}</div></section></main>`;
+const credBox = r => r == 'admin' ? `<div class="border rounded p-3 small bg-light"><strong>Legacy website administrator</strong><div class="mt-2">Username: <code>${e(ADMIN_USER)}</code> / Password: <code>${e(ADMIN_PASS)}</code></div><div class="text-danger mt-2">Change these credentials before deployment.</div></div>` : '';
+const syncRole = () => {
+  const l = $('#lid'); if (!l) return;
+  const a = $('#r-admin').checked;
+  $('#lidl').textContent = a ? 'Username' : 'Email address'; $('#lidh').hidden = a; l.type = a ? 'text' : 'email';
+  if (a) { l.removeAttribute('pattern'); l.removeAttribute('data-v'); } else { l.setAttribute('pattern', EP); l.setAttribute('data-v', 'em'); }
+  chk(l, false);
+  $('#cred').innerHTML = credBox(document.querySelector('input[name=role]:checked').value);
+};
+
+/* ---- signed-in views ---- */
+const NAV = {
+  admin: [['dashboard','Dashboard'],['students','Students'],['tutors','Tutors'],['sessions','Sessions'],['attendance','Attendance'],['reports','Reports']],
+  tutor: [['dashboard','Dashboard'],['students','My students'],['sessions','My sessions'],['grades','Grades'],['attendance','Attendance'],['profile','My profile']],
+  student: [['dashboard','Dashboard'],['tutors','Find a tutor'],['book','Book a session'],['sessions','My sessions'],['performance','Performance'],['attendance','Attendance'],['profile','My profile']]
+};
+const sl = s => `${nm(by(db.students, s.sid))} with ${nm(by(db.tutors, s.tid))}, ${fd(s.date)}`;
+const sortS = () => db.sessions.slice().sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+const attJ = () => db.attendance.slice().reverse().map(a => { const s = by(db.sessions, a.sess) || {}; return {...a, st: by(db.students, s.sid), tu: by(db.tutors, s.tid), s}; });
+const pendFirst = a => a.slice().sort((x, y) => (y.status == 'Pending') - (x.status == 'Pending') || y.id - x.id);
+const avg = a => a.length ? Math.round(a.reduce((t, g) => t + g.score, 0) / a.length) : 0;
+const gb = n => `<span class="badge text-bg-${n >= 70 ? 'success' : n >= 50 ? 'warning' : 'danger'}">${n}%</span>`;
+const myGrades = id => db.grades.filter(g => g.sid === id).sort((a, b) => b.id - a.id);
+const rate = a => a.length ? Math.round(a.filter(x => x.status == 'Present').length / a.length * 100) : 0;
+const attForm = (f, rows) => card('Record attendance', `<form data-f="${f}" class="row gx-3 align-items-end">${sel('as1', 'session', 'Session', opt(rows, sl, 'Select a session'))}${sel('as2', 'status', 'Status', '<option>Present</option><option>Absent</option>', 'col-md-3')}<div class="col-md-3 mb-3"><button class="btn btn-primary w-100">Save</button></div></form>`);
+
+const V = {
+  admin: {
+    dashboard: () => hd('Dashboard', 'Overview of the programme.') + `<div class="row g-3">${stat(db.students.length, 'Students', 'students')}${stat(db.tutors.length, 'Tutors', 'tutors')}${stat(db.sessions.length, 'Sessions', 'sessions')}${stat(db.students.concat(db.tutors).filter(x => x.status == 'Pending').length, 'Awaiting approval', 'students')}</div>`,
+    students: () => hd('Students', 'Approve registrations or add a student directly.') + card('Add a student', `<form data-f="as">${pf('as', 0, 0, 1)}<button class="btn btn-primary">Add student</button></form>`)
+      + tbl(['Name','Email','Phone','Status','Actions'], pendFirst(db.students).map(s => [e(nm(s)), e(s.email), e(s.phone), badge(s.status), (s.status != 'Approved' ? btn('sa', s.id, 'Approve', 'btn-success') + ' ' : '') + btn('sd', s.id, 'Delete', 'btn-outline-danger')]), 'No students yet. Add one above or wait for registrations.'),
+    tutors: () => hd('Tutors', 'Review applications or add a tutor directly.') + card('Add a tutor', `<form data-f="at">${pf('at', 1, 0, 1)}<button class="btn btn-primary">Add tutor</button></form>`)
+      + tbl(['Name','Subject','Email','Phone','Status','Actions'], pendFirst(db.tutors).map(t => [e(nm(t)), e(t.subject), e(t.email), e(t.phone), badge(t.status), (t.status != 'Approved' ? btn('ts', t.id, 'Approve', 'btn-success', 'Approved') + ' ' : '') + (t.status == 'Pending' ? btn('ts', t.id, 'Reject', 'btn-outline-danger', 'Rejected') : '') + (t.status == 'Approved' ? '&mdash;' : '')]), 'No tutors yet.'),
+    sessions: () => hd('Sessions', 'Schedule a tutoring session.') + card('Add a session', `<form data-f="ss"><div class="row gx-3">${sel('s1', 'student', 'Student', opt(db.students.filter(x => x.status == 'Approved'), nm, 'Select a student'))}${sel('s2', 'tutor', 'Tutor', opt(db.tutors.filter(x => x.status == 'Approved'), t => nm(t) + ' (' + t.subject + ')', 'Select a tutor'))}<div class="col-md-4 mb-3"><label class="form-label" for="s3">Date</label><input class="form-control" id="s3" type="date" name="date" required></div><div class="col-md-4 mb-3"><label class="form-label" for="s4">Time</label><input class="form-control" id="s4" type="time" name="time" required></div><div class="col-md-4 mb-3"><label class="form-label" for="s5">Venue</label><input class="form-control" id="s5" name="venue" maxlength="100" required></div></div><button class="btn btn-primary">Schedule session</button></form>`)
+      + tbl(['Student','Tutor','Date','Time','Venue'], sortS().map(s => [e(nm(by(db.students, s.sid))), e(nm(by(db.tutors, s.tid))), fd(s.date), e(s.time), e(s.venue)]), 'No sessions scheduled yet. Use the form above.'),
+    attendance: () => hd('Attendance', 'Record whether a student attended a session.') + attForm('aa', sortS())
+      + tbl(['Student','Tutor','Date','Status'], attJ().map(a => [e(nm(a.st)), e(nm(a.tu)), fd(a.date), badge(a.status)]), 'No attendance recorded yet.'),
+    reports: () => `<div class="page-head d-flex justify-content-between align-items-start flex-wrap gap-2"><div><h1>Reports</h1><p class="text-muted mb-0">Programme totals and the full attendance record.</p></div><button class="btn btn-outline-primary no-print" onclick="print()">Print report</button></div><div class="row g-3 mb-4">${stat(db.students.length, 'Students', 'students')}${stat(db.tutors.length, 'Tutors', 'tutors')}${stat(db.sessions.length, 'Sessions', 'sessions')}${stat(rate(db.attendance) + '%', 'Attendance rate', 'attendance')}</div>`
+      + tbl(['Student','Tutor','Date','Status'], attJ().map(a => [e(nm(a.st)), e(nm(a.tu)), fd(a.date), e(a.status)]), 'No attendance recorded yet.')
+  },
+  tutor: {
+    dashboard: a => { const m = db.sessions.filter(s => s.tid === a.id), t = m.filter(s => s.date == td()), at = attJ().filter(x => x.s.tid === a.id);
+      return hd('Welcome, ' + e(a.first), 'Your teaching at a glance.') + `<div class="row g-3 mb-4">${stat(new Set(m.map(s => s.sid)).size, 'Students', 'students')}${stat(m.length, 'Sessions', 'sessions')}${stat(at.length, 'Attendance records', 'attendance')}${stat(rate(at) + '%', 'Present rate', 'attendance')}</div>`
+        + card("Today's sessions", tbl(['Student','Time','Venue'], t.map(s => [e(nm(by(db.students, s.sid))), e(s.time), e(s.venue)]), 'No sessions today.')); },
+    students: a => { const m = db.sessions.filter(x => x.tid === a.id);
+      return hd('My students', 'Students who have sessions with you.') + tbl(['Student','Email','Sessions','Next session','Average grade'], [...new Set(m.map(x => x.sid))].map(i => by(db.students, i)).filter(Boolean).map(st => { const ss = m.filter(x => x.sid === st.id), nx = ss.filter(x => x.date >= td()).sort((x, y) => (x.date + x.time).localeCompare(y.date + y.time))[0], g = db.grades.filter(x => x.sid === st.id && x.tid === a.id); return [e(nm(st)), e(st.email), ss.length, nx ? fd(nx.date) + ', ' + e(nx.time) : '&mdash;', g.length ? gb(avg(g)) : '&mdash;']; }), 'No students have booked a session with you yet.'); },
+    sessions: a => hd('My sessions', 'Mark whether each student was present.') + tbl(['Student','Date','Time','Venue','Attendance'], sortS().filter(x => x.tid === a.id).map(x => { const r = db.attendance.find(y => y.sess === x.id); return [e(nm(by(db.students, x.sid))), fd(x.date), e(x.time), e(x.venue), r ? badge(r.status) : x.date > td() ? '<span class="text-muted">Not held yet</span>' : btn('pr', x.id, 'Present', 'btn-success') + ' ' + btn('ab', x.id, 'Absent', 'btn-outline-danger')]; }), 'No sessions yet.'),
+    grades: a => { const ids = [...new Set(db.sessions.filter(x => x.tid === a.id).map(x => x.sid))].map(i => by(db.students, i)).filter(Boolean);
+      return hd('Grades', "Grade your students' " + e(a.subject) + ' work.') + card('Add a grade', `<form data-f="gr" class="row gx-3">${sel('g1', 'student', 'Student', opt(ids, nm, 'Select a student'))}<div class="col-md-6 mb-3"><label class="form-label" for="g2">Work graded</label><input class="form-control" id="g2" name="title" maxlength="100" placeholder="e.g. Fractions test" required></div><div class="col-md-3 mb-3"><label class="form-label" for="g3">Score (%)</label><input class="form-control" id="g3" name="score" type="number" min="0" max="100" step="1" required></div><div class="col-md-3 mb-3 d-flex align-items-end"><button class="btn btn-primary w-100">Save grade</button></div></form>`)
+        + tbl(['Student','Work','Score','Date'], db.grades.filter(g => g.tid === a.id).sort((x, y) => y.id - x.id).map(g => [e(nm(by(db.students, g.sid))), e(g.title), gb(g.score), fd(g.date)]), 'No grades yet.'); },
+    attendance: a => hd('Attendance', 'Record whether a student attended a session.') + attForm('ta', sortS().filter(s => s.tid === a.id)) + tbl(['Student','Date','Status'], attJ().filter(x => x.s.tid === a.id).map(x => [e(nm(x.st)), fd(x.date), badge(x.status)]), 'No attendance recorded yet.'),
+    profile: a => hd('My profile', '') + prof([['Name', e(nm(a))], ['Subject', e(a.subject)], ['Email', e(a.email)], ['Phone', e(a.phone)], ['Status', badge(a.status)]])
+  },
+  student: {
+    dashboard: a => { const m = sortS().filter(s => s.sid === a.id).reverse(), up = m.filter(s => s.date >= td()), at = attJ().filter(x => x.s.sid === a.id);
+      return hd('Welcome, ' + e(a.first), 'Your sessions and attendance at a glance.') + alertH('success', 'Your account is approved and active.') + `<div class="row g-3 mb-4">${stat(up.length, 'Upcoming sessions', 'sessions')}${stat(at.filter(x => x.status == 'Present').length, 'Present', 'attendance')}${stat(at.filter(x => x.status == 'Absent').length, 'Absent', 'attendance')}${stat(myGrades(a.id).length ? avg(myGrades(a.id)) + '%' : '&mdash;', 'Average grade', 'performance')}</div>`
+        + card('Next sessions', tbl(['Tutor','Subject','Date','Time','Venue'], up.slice(0, 5).map(s => { const t = by(db.tutors, s.tid); return [e(nm(t)), e(t && t.subject), fd(s.date), e(s.time), e(s.venue)]; }), 'No upcoming sessions.')); },
+    tutors: () => hd('Find a tutor', 'Search by name or subject, then book a session.') + '<input class="form-control mb-3" type="search" data-filter placeholder="Search tutors, e.g. Mathematics" aria-label="Search tutors">'
+      + tbl(['Tutor','Subject','Email','Book'], db.tutors.filter(t => t.status == 'Approved').map(t => [e(nm(t)), e(t.subject), e(t.email), btn('pick', t.id, 'Book', 'btn-primary')]), 'No tutors available yet.'),
+    book: () => hd('Book a session', 'Choose a tutor, a day and a time.') + card('New booking', `<form data-f="bk" class="row gx-3">${sel('b1', 'tutor', 'Tutor', opt(db.tutors.filter(x => x.status == 'Approved'), t => nm(t) + ' (' + t.subject + ')', 'Select a tutor', pre))}<div class="col-md-6 mb-3"><label class="form-label" for="b2">Date</label><input class="form-control" id="b2" name="date" type="date" min="${td()}" required></div>${sel('b3', 'time', 'Time', ['08','09','10','11','12','13','14','15','16'].map(h => `<option>${h}:00</option>`).join(''))}${sel('b4', 'venue', 'Venue', '<option>Aspire Centre</option><option>Online</option>')}<div class="col-12"><button class="btn btn-primary">Book session</button></div></form>`),
+    performance: a => { const g = myGrades(a.id), pres = attJ().filter(x => x.s.sid === a.id && x.status == 'Present'), subs = [...new Set(g.map(x => x.subject).concat(db.sessions.filter(x => x.sid === a.id).map(x => (by(db.tutors, x.tid) || {}).subject)).filter(Boolean))];
+      return hd('Performance', 'Your progress by subject and your latest grades.') + (subs.length ? `<div class="row g-3 mb-4">${subs.map(sb => { const gs = g.filter(x => x.subject == sb).reverse(), av = avg(gs), tr = gs.length > 1 ? gs[gs.length - 1].score - gs[0].score : null, pr = pres.filter(x => (x.tu || {}).subject == sb).length;
+        return `<div class="col-md-6 col-lg-4"><div class="panel-card h-100"><h2 class="mb-2">${e(sb)}</h2><div class="d-flex justify-content-between"><span class="fs-3 fw-bold">${gs.length ? av + '%' : '&mdash;'}</span><span class="text-muted align-self-end">${tr == null ? '' : (tr >= 0 ? '&#9650; +' : '&#9660; ') + tr + ' since first grade'}</span></div><div class="progress my-2" role="progressbar" aria-label="${e(sb)} average" aria-valuenow="${av}" aria-valuemin="0" aria-valuemax="100"><div class="progress-bar" style="width:${av}%"></div></div><small class="text-muted">${gs.length} graded &middot; ${pr} session(s) attended</small></div></div>`; }).join('')}</div>` : alertH('info', 'Book a session to start tracking your progress.'))
+        + '<h2 class="h5 mb-2">Recent grades</h2>' + tbl(['Subject','Work','Score','Tutor','Date'], g.slice(0, 10).map(x => [e(x.subject), e(x.title), gb(x.score), e(nm(by(db.tutors, x.tid))), fd(x.date)]), 'No grades yet. Your tutors add them after your sessions.'); },
+    profile: a => hd('My profile', '') + prof([['Name', e(nm(a))], ['Email', e(a.email)], ['Phone', e(a.phone)], ['Status', badge(a.status)]]),
+    sessions: a => hd('My sessions', 'All sessions scheduled for you.') + tbl(['Tutor','Subject','Date','Time','Venue'], sortS().filter(s => s.sid === a.id).reverse().map(s => { const t = by(db.tutors, s.tid); return [e(nm(t)), e(t && t.subject), fd(s.date), e(s.time), e(s.venue)]; }), 'No sessions scheduled yet.'),
+    attendance: a => hd('Attendance', 'Your attendance history.') + tbl(['Date','Session','Tutor','Status'], attJ().filter(x => x.s.sid === a.id).map(x => [fd(x.date), fd(x.s.date) + ', ' + e(x.s.time), e(nm(x.tu)), badge(x.status)]), 'No attendance recorded yet.')
+  }
+};
+
+/* ---- render ---- */
+function cur() {
+  if (!me) return null;
+  if (me.role == 'admin') return db.admins.find(x => x.u === me.id) || null;
+  const a = by(db[me.role + 's'], me.id); return a && a.status == 'Approved' ? a : null;
+}
+function render() {
+  if (!ready) {
+    app.innerHTML = connectionError
+      ? `<main class="container py-5">${alertH('danger', e(connectionError))}</main>`
+      : '<main class="container py-5"><p class="text-muted" role="status">Connecting to Firebase...</p></main>';
+    return;
+  }
+  let sec = location.hash.slice(1), a = cur();
+  if (me && !a) { me = null; sessionStorage.removeItem('me'); note = {t:'warning', m:'Your account is no longer active. Contact the administrator.'}; }
+  document.body.classList.remove('nav-open');
+  document.body.className = me ? 'is-app' : 'is-auth';
+  if (!me) {
+    if (!AU[sec]) sec = 'login';
+    app.innerHTML = authScreen(sec); document.title = 'Aspire Youth Initiative'; syncRole(); return;
+  }
+  if (!V[me.role][sec]) sec = 'dashboard';
+  const pend = {students: db.students.filter(x => x.status == 'Pending').length, tutors: db.tutors.filter(x => x.status == 'Pending').length};
+  app.innerHTML = `<header class="topbar"><button class="nav-toggle" type="button" aria-label="Open menu"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><strong>Aspire Youth Initiative</strong></header><div class="scrim"></div><aside class="sidebar"><div class="brand"><span class="star">&#9733;</span>Aspire Youth<small>Initiative</small></div><nav class="side-nav">${NAV[me.role].map(([k, l]) => `<a href="#${k}" class="${k == sec ? 'active' : ''}"><span>${l}</span>${me.role == 'admin' && pend[k] ? `<span class="count">${pend[k]}</span>` : ''}</a>`).join('')}</nav><div class="side-foot"><div class="who"><strong>${e(me.role == 'admin' ? a.u : nm(a))}</strong><span>${me.role == 'admin' ? 'Administrator' : cap(me.role)}</span></div><button class="btn btn-outline-light btn-sm w-100" data-act="out">Log out</button></div></aside><main class="main"><div id="note">${take()}</div>${V[me.role][sec](a)}</main>`;
+  document.title = NAV[me.role].find(n => n[0] == sec)[1] + ' | Aspire Youth Initiative';
+  window.scrollTo(0, 0);
+}
+
+/* ---- form handlers ---- */
+const mk = (t, st, to, msg) => async d => {
+  const er = vp(d, t, 'confirm' in d); if (er.length) return fail(er);
+  const c = db[t ? 'tutors' : 'students'], em = d.email.trim().toLowerCase();
+  let accountCreated = false;
+  if (c.some(x => x.email === em)) return fail(['That email address is already registered.']);
+  try {
+    const credential = await createUserWithEmailAndPassword(auth, em, d.password);
+    accountCreated = true;
+    const uid = credential.user.uid;
+    const id = nextId();
+    const profile = {
+      uid, id, first:d.first.trim(), last:d.last.trim(), fullName:(d.first.trim() + ' ' + d.last.trim()).trim(),
+      email:em, phone:(d.phone || '').trim(), subject:(d.subject || '').trim(), bio:(d.bio || d.subject || '').trim(),
+      role:t ? 'Tutor' : 'Student', status:st, location:'', createdAt:Date.now()
+    };
+    // Canonical profile plus legacy role collection used by the existing website dashboards.
+    await set(refForUser(uid), profile);
+    await set(ref(firebaseDb, 'ayi/' + (t ? 'tutors/' : 'students/') + uid), profile);
+    const rows = db[t ? 'tutors' : 'students'];
+    if (!rows.some(x => x.uid === uid)) rows.push(profile);
+    const saved = await save();
+    await signOut(auth).catch(() => {});
+    if (saved) ok(msg, to);
+  } catch (error) {
+    console.error('Firebase registration failed:', {
+      code: error?.code || '(no Firebase error code)',
+      message: error?.message || String(error),
+      customData: error?.customData || null,
+      error
+    });
+    if (accountCreated && auth.currentUser) {
+      try { await signOut(auth); } catch (signOutError) { console.error('Could not sign out after registration failure:', signOutError); }
+    }
+    fail([authErrorMessage(error)]);
+  }
+};
+const refForUser = uid => ref(firebaseDb, 'ayi/users/' + uid);
+const authErrorMessage = error => ({
+  'auth/email-already-in-use':'This email is already registered. Please log in.',
+  'auth/invalid-email':'Please enter a valid email address.',
+  'auth/weak-password':'Choose a password with at least 6 characters.',
+  'auth/network-request-failed':'Network error. Check your internet connection and try again.',
+  'auth/invalid-credential':'Incorrect email or password.',
+  'auth/operation-not-allowed':'Email/password registration is disabled in Firebase Authentication.',
+  'auth/unauthorized-domain':'This website domain is not authorized in Firebase Authentication settings. Add localhost (without the port number).',
+  'auth/invalid-api-key':'The Firebase API key is invalid. Check the apiKey in assets/firebase.js.',
+  'auth/too-many-requests':'Too many attempts. Wait a little and try again.',
+  'auth/network-request-failed':'Network error. Check your internet connection and try again.',
+  'auth/captcha-check-failed':'Firebase reCAPTCHA verification failed. Check the reCAPTCHA / Identity Platform settings in Firebase Console.',
+  'auth/recaptcha-not-enabled':'Firebase reCAPTCHA protection is not configured correctly for this project.',
+  'auth/missing-recaptcha-token':'Firebase did not receive a reCAPTCHA token. Check the reCAPTCHA / Identity Platform settings.',
+  'auth/invalid-recaptcha-token':'Firebase rejected the reCAPTCHA token. Check the reCAPTCHA site configuration and authorized domains.'
+}[error?.code] || error?.message || 'Authentication failed. Open the browser console for the full error.');
+const att = (d, to = 'attendance') => {
+  const id = +d.session, s = by(db.sessions, id);
+  if (!s || (me.role == 'tutor' && s.tid !== me.id)) return fail(['Choose one of the listed sessions.']);
+  if (s.date > td()) return fail(['This session has not taken place yet.']);
+  if (db.attendance.some(a => a.sess === id)) return fail(['Attendance for this session has already been recorded.']);
+  db.attendance.push({id: nextId(), sess: id, status: d.status == 'Absent' ? 'Absent' : 'Present', date: s.date});
+  return save().then(saved => { if (saved) ok('Attendance saved.', to); });
+};
+const H = {
+  login: async d => {
+    const r = d.role, id = d.identifier.trim();
+    if (r != 'admin' && !EM.test(id)) return fail(['Email must contain an @ and end in .com.']);
+    if (r === 'admin') {
+      try {
+        const h = await hash(d.password);
+        const a = db.admins.find(x => x.u === id);
+        if (!a || (a.p !== h && a.p !== 'p:' + d.password)) return fail(['Incorrect username or password.']);
+        me = {role:'admin', id:a.u}; sessionStorage.setItem('me', JSON.stringify(me)); go('dashboard');
+      } catch (error) { console.error(error); fail(['Could not verify administrator credentials.']); }
+      return;
+    }
+    try {
+      const credential = await signInWithEmailAndPassword(auth, id.toLowerCase(), d.password);
+      const profile = db[r + 's'].find(x => x.uid === credential.user.uid || x.email === credential.user.email);
+      if (!profile) { await signOut(auth); return fail(['Your account profile was not found. Please contact the administrator.']); }
+      if (profile.status !== 'Approved') {
+        await signOut(auth);
+        return fail([profile.status === 'Rejected' ? 'Your application was rejected. Please contact the administrator.' : 'Your registration is awaiting administrator approval.']);
+      }
+      me = {role:r, id:profile.id, uid:credential.user.uid};
+      sessionStorage.setItem('me', JSON.stringify(me)); go('dashboard');
+    } catch (error) { console.error('Firebase login failed.', error); fail([authErrorMessage(error)]); }
+  },
+  rs: mk(0, 'Pending', 'login', 'Registration received. You can log in once an administrator approves it.'),
+  rt: mk(1, 'Pending', 'login', 'Application received. You can log in once an administrator approves it.'),
+  as: mk(0, 'Approved', 'students', 'Student added and approved.'),
+  at: mk(1, 'Approved', 'tutors', 'Tutor added and approved.'),
+  ss: d => {
+    const sid = +d.student, tid = +d.tutor;
+    if (!by(db.students, sid) || !by(db.tutors, tid)) return fail(['Choose a student and a tutor.']);
+    if (!d.venue.trim()) return fail(['Enter a venue.']);
+    db.sessions.push({id: nextId(), sid, tid, date: d.date, time: d.time, venue: d.venue.trim()});
+    return save().then(saved => { if (saved) ok('Session scheduled.', 'sessions'); });
+  },
+  gr: d => {
+    const sid = +d.student, sc = Number(d.score), t = by(db.tutors, me.id);
+    if (!db.sessions.some(x => x.sid === sid && x.tid === me.id)) return fail(['Choose one of your students.']);
+    if (!d.title.trim()) return fail(['Enter what was graded.']);
+    if (!Number.isInteger(sc) || sc < 0 || sc > 100) return fail(['Score must be a whole number from 0 to 100.']);
+    db.grades.push({id: nextId(), sid, tid: me.id, subject: t.subject, title: d.title.trim(), score: sc, date: td()});
+    return save().then(saved => { if (saved) ok('Grade saved.', 'grades'); });
+  },
+  bk: d => {
+    const tid = +d.tutor, t = by(db.tutors, tid);
+    if (!t || t.status != 'Approved') return fail(['Choose a tutor.']);
+    if (d.date < td()) return fail(['Choose today or a future date.']);
+    if (db.sessions.some(x => x.tid === tid && x.date === d.date && x.time === d.time)) return fail(['That tutor is already booked at this time. Pick another time.']);
+    if (db.sessions.some(x => x.sid === me.id && x.date === d.date && x.time === d.time)) return fail(['You already have a session at that time.']);
+    db.sessions.push({id: nextId(), sid: me.id, tid, date: d.date, time: d.time, venue: d.venue}); pre = 0;
+    return save().then(saved => { if (saved) ok('Session booked with ' + nm(t) + '.', 'sessions'); });
+  },
+  aa: att, ta: att
+};
+
+/* ---- events ---- */
+app.addEventListener('input', ev => { const t = ev.target;
+  if (t.hasAttribute('data-filter')) { const q = t.value.toLowerCase(); app.querySelectorAll('tbody tr').forEach(r => r.hidden = !r.textContent.toLowerCase().includes(q)); return; }
+  if (!t.dataset.v) return; if (t.dataset.v == 'ph') t.value = t.value.replace(/\D/g, '').slice(0, 10); chk(t, false); });
+app.addEventListener('focusout', ev => { if (ev.target.dataset && ev.target.dataset.v) chk(ev.target, true); });
+app.addEventListener('change', ev => { if (ev.target.name == 'role') syncRole(); });
+app.addEventListener('submit', ev => {
+  ev.preventDefault();
+  const f = ev.target; let bad = false;
+  f.querySelectorAll('[data-v]').forEach(t => { if (!chk(t, true)) bad = true; });
+  if (bad || !f.checkValidity()) return f.reportValidity();
+  H[f.dataset.f](Object.fromEntries(new FormData(f)));
+});
+app.addEventListener('click', ev => {
+  const t = ev.target, fl = t.closest('[data-fill]');
+  if (fl) { $('#lid').value = fl.dataset.u; $('#lpw').value = fl.dataset.p; return chk($('#lid'), false); }
+  if (t.closest('.nav-toggle')) return document.body.classList.toggle('nav-open');
+  if (t.closest('.scrim')) return document.body.classList.remove('nav-open');
+  const b = t.closest('[data-act]'); if (!b) return;
+  const id = +b.dataset.id, act = b.dataset.act;
+  if (act == 'out') { const wasAdmin = me?.role === 'admin'; me = null; sessionStorage.removeItem('me'); note = {t:'success', m:'You have been signed out.'}; if (!wasAdmin) { signOut(auth).catch(console.error).finally(() => go('login')); return; } return go('login'); }
+  if (act == 'pick') { pre = id; return go('book'); }
+  if (act == 'pr' || act == 'ab') return att({session: id, status: act == 'pr' ? 'Present' : 'Absent'}, 'sessions');
+  if (me.role != 'admin') return;
+  if (act == 'sa') { const user = by(db.students, id); user.status = 'Approved'; if (user.uid) set(ref(firebaseDb, 'ayi/users/' + user.uid + '/status'), user.status).catch(console.error); }
+  else if (act == 'ts') { const user = by(db.tutors, id); user.status = b.dataset.s; if (user.uid) set(ref(firebaseDb, 'ayi/users/' + user.uid + '/status'), user.status).catch(console.error); }
+  else if (act == 'sd') {
+    if (db.sessions.some(s => s.sid === id)) return fail(['This student cannot be deleted because they still have sessions on record.']);
+    if (!confirm('Delete this student? This cannot be undone.')) return;
+    db.students = db.students.filter(s => s.id !== id); db.grades = db.grades.filter(g => g.sid !== id);
+  }
+  save().then(saved => { if (saved) render(); });
+});
+const initialData = async () => {
+  const data = copy(legacyData || emptyData());
+  if (!data.admins.length) data.admins = [{u: ADMIN_USER, p: await hash(ADMIN_PASS)}];
+  // Do not create demo tutor profiles: every non-admin account must be created in Firebase Authentication.
+  data.seeded = 1;
+  return data;
+};
+let initializing = false;
+const acceptData = value => {
+  db = normalizeData(value);
+  baseline = copy(db);
+  ready = true;
+  connectionError = null;
+  render();
+};
+const startFirebase = () => {
+  app.innerHTML = '<main class="container py-5"><p class="text-muted" role="status">Connecting to Firebase...</p></main>';
+  onValue(dataRef, async snapshot => {
+    const value = snapshot.val();
+    if (value !== null) return acceptData(value);
+    if (initializing) return;
+    initializing = true;
+    try {
+      const seed = await initialData();
+      const result = await runTransaction(dataRef, current => current === null ? seed : undefined, {applyLocally:false});
+      if (!result.snapshot.exists()) throw new Error('Firebase initialization completed without database data.');
+      acceptData(result.snapshot.val());
+    } catch (error) {
+      console.error('Firebase database initialization failed.', error);
+      connectionError = error.message === HASH_ERROR ? HASH_ERROR : 'Could not connect to Firebase. Check your internet connection, Firebase configuration, and Realtime Database read/write rules.';
+      render();
+    }
+  }, error => {
+    console.error('Firebase database read failed.', error);
+    connectionError = error.code === 'PERMISSION_DENIED' || /permission denied/i.test(error.message || '')
+      ? 'Firebase denied access (PERMISSION_DENIED). For fake-data demos only, publish database.demo-only.rules.json in Firebase Console > Realtime Database > Rules. Anyone will then be able to read and modify /ayi.'
+      : 'Could not read the Firebase database. Check your internet connection, Firebase configuration, and Realtime Database read rules.';
+    render();
+  });
+};
+window.addEventListener('hashchange', render);
+startFirebase();
+})();
+</script>
+</body>
+</html>
